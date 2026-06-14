@@ -78,6 +78,37 @@ class Logger:
     def debug(self, msg: str) -> None: self.log("DEBUG", msg)
 
 
+import logging as _logging
+
+
+def setup_logging(
+    name: str = "orionvm",
+    *,
+    path: "Path | str | None" = None,
+    level: int = _logging.INFO,
+) -> Logger:
+    """配置标准 logging 体系 ( handlers: console + optional file ).
+
+    返回 Logger 适配器以保持与现有代码兼容.
+    """
+    log = _logging.getLogger(name)
+    log.setLevel(level)
+    # 避免重复添加 handler
+    if log.handlers:
+        return Logger(prefix=f"[{name}]")
+    fmt = _logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s", "%H:%M:%S")
+    sh = _logging.StreamHandler()
+    sh.setLevel(level)
+    sh.setFormatter(fmt)
+    log.addHandler(sh)
+    if path:
+        fh = _logging.FileHandler(str(path), encoding="utf-8")
+        fh.setLevel(level)
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+    return Logger(prefix=f"[{name}]")
+
+
 # ==================== 解析工具 ====================
 
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
