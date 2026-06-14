@@ -106,10 +106,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 def cmd_start(args: argparse.Namespace) -> int:
     cfg = _make_runtime(args)
-    cfg.ovpn_path = Path(args.ovpn) if getattr(args, "ovpn", None) else cfg.ovpn_path
-    if cfg.ovpn_path and not cfg.ovpn_path.exists():
-        print(f"error: --ovpn file not found: {cfg.ovpn_path}", file=sys.stderr)
-        return 1
+    # 用户通过 --ovpn 显式指定时才做存在性检查；默认路径留到 daemon 内部回退。
+    explicit_ovpn = getattr(args, "ovpn", None)
+    if explicit_ovpn:
+        p = Path(explicit_ovpn)
+        if not p.exists():
+            print(f"error: --ovpn file not found: {p}", file=sys.stderr)
+            return 1
+        cfg.ovpn_path = p
     print("orionvm start: auto scan → rank → connect → lock")
     return daemon_start(cfg)
 
