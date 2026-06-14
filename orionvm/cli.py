@@ -110,6 +110,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     if cfg.ovpn_path and not cfg.ovpn_path.exists():
         print(f"error: --ovpn file not found: {cfg.ovpn_path}", file=sys.stderr)
         return 1
+    print("orionvm start: auto scan → rank → connect → lock")
     return daemon_start(cfg)
 
 

@@ -92,35 +92,68 @@ def _firewall_apply(cfg: RuntimeConfig, exit_ip: str | None) -> None:
     apply_lock(ep)
 
 
+def _discover_ovpn(state: _DaemonState, top_node) -> str | None:
+    """Best-effort discover full OpenVPN config text for *top_node*."""
+    cfg = state.cfg
+    log = state.log
+    raw: str | None = getattr(top_node, "raw_config", None)
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    candidates = [
+        cfg.data_dir / f"{top_node.id or top_node.ip}.ovpn",
+        cfg.data_dir / "node.ovpn",
+        Path("/tmp/orionvm.ovpn"),
+        cfg.ovpn_path,
+    ]
+    for p in candidates:
+        try:
+            if p.exists():
+                text = p.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
+                    log.info(f"loaded ovpn from {p}")
+                    return text
+        except OSError:
+            continue
+    return None
+
+
 def _run_cycle(state: _DaemonState) -> bool:
     """Run one fetch → probe → (geo) → rank → take-over cycle.
-    Returns True if a node was successfully taken over.
+
+    Loop is self-healing:
+      - no rankable nodes ⇒ skip this cycle, sleep, retry.
+      - no ovpn text ⇒ skip this cycle, sleep, retry.
+      - connect fails ⇒ stop any leftover ovpn, fall through to sleep/retry.
     """
     cfg = state.cfg
     log = state.log
     state.refresh_count += 1
 
     log.info(f"=== cycle #{state.refresh_count} start ===")
-    try:
-        pipeline = _build_pipeline(cfg, log)
-    except Exception as exc:  # noqa: BLE001
-        log.error(f"pipeline init failed: {exc}")
-        return False
 
+    # ---- 1. Pipeline: fetch → probe → geo → rank ----
     try:
-        ranked = pipeline.run()
+        pl = _build_pipeline(cfg, log)
+        ranked = pl.run()
     except Exception as exc:  # noqa: BLE001
         log.error(f"pipeline run failed: {exc}")
         return False
 
     if not ranked:
-        log.warning("no ranked nodes to take over")
+        log.warning("no ranked nodes this cycle, will retry after backoff")
         return False
 
     top = ranked[0]
-    log.info(f"top node: {top.node.ip} ({top.node.country}, score={top.score:.1f}, "
-             f"lat={top.node.latency_ms:.0f}ms)")
+    log.info(f"top node: {top.node.ip} ({top.node.country_code}, "
+             f"score={top.score:.1f}, lat={top.node.latency_ms:.0f}ms)")
 
+    # ---- 2. Discover OpenVPN config text ----
+    cfg_text = _discover_ovpn(state, top.node)
+    if not cfg_text:
+        log.error("top node has no raw_config and no cached .ovpn found; cannot start OpenVPN")
+        return False
+
+    # ---- 3. Start OpenVPN ----
     manager = OVPNManager(
         ovpn_path=cfg.ovpn_path,
         ovpn_log=cfg.ovpn_log,
@@ -129,27 +162,30 @@ def _run_cycle(state: _DaemonState) -> bool:
     )
     state.ovpn = manager
 
-    # Translate mode
     mode = OVPNMode.OUT if cfg.underway_mode == "out" else OVPNMode.FULL
-    # We don't have the whole .ovpn config in Node; the caller should populate
-    # it in config: for now we pass top.node.raw_config.
-    # The actual usage would be top.node.raw_config  (would need to be stored)
-    config_text = getattr(top.node, "raw_config", "")
-    if not config_text:
-        log.error("node has no raw_config; cannot start OpenVPN")
-        return False
-
-    result: OVPNResult = manager.start(config_text, mode)
+    result: OVPNResult = manager.start(cfg_text, mode)
     if not result.started:
         log.error(f"takeover failed: {result.msg}")
+        state.ovpn = None
         return False
 
     state.current_node = top.node
     state.current_exit_ip = result.exit_ip
     log.info(f"connected, exit_ip={result.exit_ip or 'unknown'}")
 
-    # Apply firewall (only in out-mode)
-    if cfg.underway_mode == "out":
+    # ---- 4. Verify exit IP (optional) ----
+    if result.exit_ip is None:
+        log.warning("OpenVPN up but exit IP probe returned None; "
+                    "continuing (may be DNS/routing issue)")
+
+    # ---- 5. Lock firewall (outbound-only mode only) ----
+    if cfg.underway_mode == "out" and cfg.auto_firewall:
+        ep = VpnEndpoint(
+            server_ip=result.exit_ip or (top.node.ip or "0.0.0.0"),
+            port=1194,
+            iface_phys=cfg.iface_phys,
+            iface_vpn=cfg.iface_vpn,
+        )
         _firewall_apply(cfg, result.exit_ip)
 
     return True
