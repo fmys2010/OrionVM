@@ -1,0 +1,21 @@
+[project]
+name = "orionvm"
+version = "0.2.0"
+description = "VPNGate 节点获取 + 质量测试 + 评分排序 CLI"
+requires-python = ">=3.10"
+dependencies = []
+authors = [{ name = "fmys2010" }]
+license = { text = "MIT" }
+
+[project.scripts]
+orionvm = "orionvm.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["orionvm*"]
+
+[tool.setuptools.package-data]
+"orionvm" = ["py.typed"]
