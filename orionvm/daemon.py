@@ -76,7 +76,7 @@ def _build_pipeline(cfg: RuntimeConfig, log: Logger) -> Pipeline:
     return Pipeline(log=log, cfg=cfg)
 
 
-def _firewall_apply(cfg: RuntimeConfig, exit_ip: str | None) -> None:
+def _firewall_apply(cfg: RuntimeConfig, exit_ip: str | None, *, port: int = 1194) -> None:
     if not cfg.auto_firewall:
         return
     if cfg.underway_mode != "out":
@@ -85,7 +85,7 @@ def _firewall_apply(cfg: RuntimeConfig, exit_ip: str | None) -> None:
         return
     ep = VpnEndpoint(
         server_ip=exit_ip,
-        port=cfg.connect_timeout if cfg.connect_timeout else 25, # default port fallback  # TODO: expose real port
+        port=port,
         iface_phys=cfg.iface_phys,
         iface_vpn=cfg.iface_vpn,
     )
@@ -180,13 +180,11 @@ def _run_cycle(state: _DaemonState) -> bool:
 
     # ---- 5. Lock firewall (outbound-only mode only) ----
     if cfg.underway_mode == "out" and cfg.auto_firewall:
-        ep = VpnEndpoint(
-            server_ip=result.exit_ip or (top.node.ip or "0.0.0.0"),
+        _firewall_apply(
+            cfg,
+            result.exit_ip,
             port=1194,
-            iface_phys=cfg.iface_phys,
-            iface_vpn=cfg.iface_vpn,
         )
-        _firewall_apply(cfg, result.exit_ip)
 
     return True
 
