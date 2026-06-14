@@ -74,6 +74,8 @@ class Logger:
 
     def info(self, msg: str) -> None: self.log("INFO ", msg)
     def warn(self, msg: str) -> None: self.log("WARN ", msg)
+    # logging 标准库惯例兼容: 'warning' 与 'warn' 等价
+    warning = warn  # type: ignore[assignment]
     def error(self, msg: str) -> None: self.log("ERROR", msg)
     def debug(self, msg: str) -> None: self.log("DEBUG", msg)
 

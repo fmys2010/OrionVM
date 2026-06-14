@@ -74,7 +74,7 @@ def _install_signals(state: _DaemonState) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_pipeline(cfg: RuntimeConfig, log: Logger) -> Pipeline:
-    return Pipeline(log=log, cfg=cfg)
+    return Pipeline(config=cfg, logger=log)
 
 
 def _firewall_apply(cfg: RuntimeConfig, exit_ip: str | None, *, port: int = 1194) -> None:
