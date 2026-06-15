@@ -21,16 +21,19 @@ class RuntimeConfig:
 
     # ---- 过滤与刷新 ----
     max_scan: int = 80
+    max_rows: int = 80
     top_n: int = 20
     workers: int = 16
-    refresh_interval: int = 5 * 3600       # 后台异步刷新间隔
-    run_geo: bool = True                   # 是否做 IP 质量查询 (--no-geo 关掉)
+    probe_workers: int = 16
+    geo_workers: int = 4
+    refresh_interval: int = 5 * 3600  # 后台异步刷新间隔
+    run_geo: bool = True  # 是否做 IP 质量查询 (--no-geo 关掉)
 
     # ---- 接管 ----
     underway_mode: Mode = "out"            # "out" = 只接管出站
     ovpn_path: Path = Path("/tmp/orionvm.ovpn")
     ovpn_log: Path = Path("/tmp/orionvm_ovpn.log")
-    connect_timeout: int = 25
+    connect_timeout: int = 60
 
     # ---- 防火墙 ----
     iface_phys: str = "eth0"

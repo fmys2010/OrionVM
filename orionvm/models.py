@@ -88,6 +88,18 @@ class Node:
     protocol: str = "tcp"
     openvpn_config_b64: str = ""
 
+    @property
+    def raw_config(self) -> str | None:
+        """Decode base64 OpenVPN config if present."""
+        if not self.openvpn_config_b64:
+            return None
+        try:
+            import base64
+            pad = "=" * ((-len(self.openvpn_config_b64)) % 4)
+            return base64.b64decode(self.openvpn_config_b64 + pad).decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
     geo: GeoInfo = field(default_factory=GeoInfo)
     probe: ProbeResult = field(default_factory=ProbeResult)
 

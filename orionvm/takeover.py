@@ -31,6 +31,7 @@ Mode = Literal["out", "full"]
 _REDIRECT_LINE_RE = re.compile(r"^\s*(?:push\s+[\"']?)?redirect-gateway[^\n]*", re.IGNORECASE | re.MULTILINE)
 _BLOCK_OUTSIDE_DNS_RE = re.compile(r"^\s*block-outside-dns[^\n]*", re.IGNORECASE | re.MULTILINE)
 _DHCP_OPTION_RE = re.compile(r"^\s*dhcp-option\s+DNS[^\n]*", re.IGNORECASE | re.MULTILINE)
+_AUTH_USER_PASS_RE = re.compile(r"^\s*#?\s*auth-user-pass.*$", re.IGNORECASE | re.MULTILINE)
 
 
 def inject_outbound_mode(config: str, mode: Mode) -> str:
@@ -47,8 +48,9 @@ def inject_outbound_mode(config: str, mode: Mode) -> str:
     cleaned = _REDIRECT_LINE_RE.sub("", config)
     cleaned = _BLOCK_OUTSIDE_DNS_RE.sub("", cleaned)
     cleaned = _DHCP_OPTION_RE.sub("", cleaned)
+    cleaned = _AUTH_USER_PASS_RE.sub("", cleaned)
 
-    # 选定要插入的指令行
+    # 选定要注入的指令行
     if mode == "out":
         inject_lines = (
             "# -- injected by orionvm (mode=out) --",
@@ -71,7 +73,10 @@ def inject_outbound_mode(config: str, mode: Mode) -> str:
             break
         insert_at = i + 1
 
-    return "\n".join(lines[:insert_at] + list(inject_lines) + lines[insert_at:]) + "\n"
+    config_out = "\n".join(lines[:insert_at] + list(inject_lines) + lines[insert_at:]) + "\n"
+    # 追加 auth-user-pass 行（VPNGate 默认用户名密码都是 vpn）
+    config_out += "auth-user-pass /tmp/orionvm_auth.txt\n"
+    return config_out
 
 
 # ------------------- OVPN 进程 -------------------
@@ -132,6 +137,14 @@ class OVPNManager:
             self.ovpn_path.write_text(inject_outbound_mode(config_text, mode), encoding="utf-8")
         except OSError as e:
             return OVPNResult(False, None, f"write config failed: {e}")
+
+        # Write auth file for VPNGate (username: vpn, password: vpn)
+        auth_path = Path("/tmp/orionvm_auth.txt")
+        try:
+            auth_path.write_text("vpn\nvpn\n", encoding="utf-8")
+        except OSError as e:
+            return OVPNResult(False, None, f"write auth file failed: {e}")
+
         # 清理旧日志
         try:
             self.ovpn_log.unlink(missing_ok=True)

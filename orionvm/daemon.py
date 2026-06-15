@@ -1,10 +1,10 @@
 """OrionVM 守护进程 —— 长时运行的节点刷新 + VPN 切换 + 防火墙编排.
 
 调用:
+    python -m orionvm --start         启动守护进程 (后台运行)
+    python -m orionvm --stop          回收防火墙, 写最终状态.
+    python -m orionvm --restart       重启守护进程
 
-    python -m orionvm --start (投资选 ngrok/Ubuntu 代码昊天阁创作的 public 花样)daemon
-        停止守护进程
-    
 退出因: SIGINT SIGTERM SIGUSR1 - 回收防火墙, 写最终状态.
 """
 from __future__ import annotations
@@ -53,6 +53,28 @@ class _DaemonState:
         self.current_exit_ip: str | None = None
         self.shutdown_requested = False
         self.refresh_count = 0
+        self.blacklist: dict[str, float] = {}  # ip -> expire_timestamp
+
+    def is_blacklisted(self, ip: str) -> bool:
+        """Check if an IP is currently blacklisted."""
+        if ip in self.blacklist:
+            if time.time() < self.blacklist[ip]:
+                return True
+            # expired, remove
+            del self.blacklist[ip]
+        return False
+
+    def add_to_blacklist(self, ip: str, duration_seconds: int = 1800) -> None:
+        """Add an IP to blacklist for specified duration (default 30 min)."""
+        self.blacklist[ip] = time.time() + duration_seconds
+
+    def clean_blacklist(self) -> int:
+        """Remove expired entries, return count of remaining."""
+        now = time.time()
+        expired = [ip for ip, ts in self.blacklist.items() if ts < now]
+        for ip in expired:
+            del self.blacklist[ip]
+        return len(self.blacklist)
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +96,14 @@ def _install_signals(state: _DaemonState) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_pipeline(cfg: RuntimeConfig, log: Logger) -> Pipeline:
-    return Pipeline(config=cfg, logger=log)
+    from .pipeline import PipelineConfig
+    pcfg = PipelineConfig(
+        max_rows=int(getattr(cfg, "max_scan", 80)),
+        probe_workers=int(getattr(cfg, "workers", 16)),
+        geo_workers=int(getattr(cfg, "workers", 16)),
+        run_geo=bool(getattr(cfg, "run_geo", True)),
+    )
+    return Pipeline(config=pcfg, logger=log)
 
 
 def _firewall_apply(cfg: RuntimeConfig, exit_ip: str | None, *, port: int = 1194) -> None:
@@ -93,25 +122,34 @@ def _firewall_apply(cfg: RuntimeConfig, exit_ip: str | None, *, port: int = 1194
     apply_lock(ep)
 
 
-def _discover_ovpn(state: _DaemonState, top_node) -> str | None:
+def _discover_ovpn(top_node: Node) -> str | None:
     """Best-effort discover full OpenVPN config text for *top_node*."""
-    cfg = state.cfg
-    log = state.log
+    # 1. Prefer inline raw_config (decoded from base64 by Node.property)
     raw: str | None = getattr(top_node, "raw_config", None)
     if isinstance(raw, str) and raw.strip():
         return raw
+    # 2. Fallback to openvpn_config_b64 directly
+    b64: str = getattr(top_node, "openvpn_config_b64", "")
+    if b64:
+        try:
+            import base64
+            pad = "=" * ((-len(b64)) % 4)
+            text = base64.b64decode(b64 + pad).decode("utf-8", errors="replace")
+            if text.strip():
+                return text
+        except Exception:
+            pass
+    # 3. Fallback to disk-cached .ovpn files
     candidates = [
-        cfg.data_dir / f"{top_node.id or top_node.ip}.ovpn",
-        cfg.data_dir / "node.ovpn",
+        Path(f"/root/OrionVM/data/{top_node.id or top_node.ip}.ovpn"),
+        Path("/root/OrionVM/data/node.ovpn"),
         Path("/tmp/orionvm.ovpn"),
-        cfg.ovpn_path,
     ]
     for p in candidates:
         try:
             if p.exists():
                 text = p.read_text(encoding="utf-8", errors="replace")
                 if text.strip():
-                    log.info(f"loaded ovpn from {p}")
                     return text
         except OSError:
             continue
@@ -130,6 +168,11 @@ def _run_cycle(state: _DaemonState) -> bool:
     log = state.log
     state.refresh_count += 1
 
+    # Clean expired blacklist entries
+    remaining = state.clean_blacklist()
+    if remaining > 0:
+        log.info(f"blacklist: {remaining} IPs currently blocked")
+
     log.info(f"=== cycle #{state.refresh_count} start ===")
 
     # ---- 1. Pipeline: fetch → probe → geo → rank ----
@@ -144,50 +187,77 @@ def _run_cycle(state: _DaemonState) -> bool:
         log.warning("no ranked nodes this cycle, will retry after backoff")
         return False
 
-    top = ranked[0]
-    log.info(f"top node: {top.node.ip} ({top.node.country_code}, "
-             f"score={top.score:.1f}, lat={top.node.latency_ms:.0f}ms)")
-
-    # ---- 2. Discover OpenVPN config text ----
-    cfg_text = _discover_ovpn(state, top.node)
-    if not cfg_text:
-        log.error("top node has no raw_config and no cached .ovpn found; cannot start OpenVPN")
+    # Filter out blacklisted nodes
+    filtered = [n for n in ranked if not state.is_blacklisted(n.ip)]
+    if not filtered:
+        log.warning("all ranked nodes are blacklisted, will retry after backoff")
         return False
 
-    # ---- 3. Start OpenVPN ----
-    manager = OVPNManager(
-        ovpn_path=cfg.ovpn_path,
-        ovpn_log=cfg.ovpn_log,
-        connect_timeout=cfg.connect_timeout,
-        log=log,
-    )
-    state.ovpn = manager
+    log.info(f"ranked {len(ranked)} nodes, {len(filtered)} available after blacklist filter")
 
-    mode = OVPNMode.OUT if cfg.underway_mode == "out" else OVPNMode.FULL
-    result: OVPNResult = manager.start(cfg_text, mode)
-    if not result.started:
-        log.error(f"takeover failed: {result.msg}")
-        state.ovpn = None
-        return False
+    # Try top nodes in order (up to 5)
+    max_attempts = min(5, len(filtered))
+    attempted = []
 
-    state.current_node = top.node
-    state.current_exit_ip = result.exit_ip
-    log.info(f"connected, exit_ip={result.exit_ip or 'unknown'}")
-
-    # ---- 4. Verify exit IP (optional) ----
-    if result.exit_ip is None:
-        log.warning("OpenVPN up but exit IP probe returned None; "
-                    "continuing (may be DNS/routing issue)")
-
-    # ---- 5. Lock firewall (outbound-only mode only) ----
-    if cfg.underway_mode == "out" and cfg.auto_firewall:
-        _firewall_apply(
-            cfg,
-            result.exit_ip,
-            port=1194,
+    for attempt_idx in range(max_attempts):
+        top = filtered[attempt_idx]
+        top_latency = top.probe.latency_ms if top.probe else 0
+        top_score = score_node(top).score
+        log.info(
+            f"attempting #{attempt_idx + 1}: {top.ip} ({top.country_code}, "
+            f"score={top_score:.1f}, lat={top_latency:.0f}ms)"
         )
 
-    return True
+        # ---- 2. Discover OpenVPN config text ----
+        cfg_text = _discover_ovpn(top)
+        if not cfg_text:
+            log.error(f"{top.ip} has no .ovpn config, skipping")
+            attempted.append(top.ip)
+            continue
+
+        # ---- 3. Start OpenVPN ----
+        manager = OVPNManager(
+            ovpn_path=cfg.ovpn_path,
+            ovpn_log=cfg.ovpn_log,
+            connect_timeout=cfg.connect_timeout,
+            log=log,
+        )
+        state.ovpn = manager
+
+        mode = "out" if cfg.underway_mode == "out" else "full"
+        result: OVPNResult = manager.start(cfg_text, mode)
+        if result.started:
+            # Success!
+            state.current_node = top
+            state.current_exit_ip = result.exit_ip
+            log.info(f"connected via {top.ip}, exit_ip={result.exit_ip or 'unknown'}")
+
+            # ---- 4. Verify exit IP (optional) ----
+            if result.exit_ip is None:
+                log.warning("OpenVPN up but exit IP probe returned None; "
+                            "continuing (may be DNS/routing issue)")
+
+            # ---- 5. Lock firewall (outbound-only mode only) ----
+            if cfg.underway_mode == "out" and cfg.auto_firewall:
+                _firewall_apply(
+                    cfg,
+                    result.exit_ip,
+                    port=1194,
+                )
+
+            return True
+
+        # Connection failed
+        log.warning(f"takeover failed for {top.ip}: {result.msg}")
+        state.ovpn = None
+        attempted.append(top.ip)
+
+    # All attempts failed, add all attempted IPs to blacklist
+    log.error(f"all {len(attempted)} connection attempts failed, adding to blacklist (30min)")
+    for ip in attempted:
+        state.add_to_blacklist(ip, duration_seconds=1800)
+
+    return False
 
 
 def _teardown(state: _DaemonState) -> None:
@@ -347,7 +417,6 @@ def restart(cfg: RuntimeConfig | None = None) -> int:
     # small backoff so system settles (iptables/NAT state, TUN release)
     time.sleep(2)
     return start(cfg)
-
 
 
 
